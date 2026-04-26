@@ -1,0 +1,266 @@
+groups:
+- name: kubernetes.rules
+  interval: 30s
+  rules:
+  # Pod alerts
+  - alert: PodCrashLooping
+    expr: |
+      rate(kube_pod_container_status_restarts_total[15m]) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping"
+      description: "Pod has restarted {{ $value }} times in 15 minutes"
+
+  - alert: PodNotHealthy
+    expr: |
+      min_over_time(sum by (namespace, pod) (kube_pod_status_phase{phase=~"Pending|Unknown|Failed"})[15m:1m]) > 0
+    for: 15m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is not healthy"
+      description: "Pod has been in {{ $labels.phase }} state for more than 15 minutes"
+
+  - alert: ContainerOomKiller
+    expr: |
+      kube_pod_container_status_last_state_reason{reason="OOMKilled"} == 1
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Container {{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} was OOMKilled"
+
+  # Node alerts
+  - alert: NodeNotReady
+    expr: |
+      kube_node_status_condition{condition="Ready",status="true"} == 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Node {{ $labels.node }} is not ready"
+      description: "Node has been unready for more than 5 minutes"
+
+  - alert: NodeMemoryPressure
+    expr: |
+      kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Node {{ $labels.node }} has memory pressure"
+
+  - alert: NodeDiskPressure
+    expr: |
+      kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Node {{ $labels.node }} has disk pressure"
+
+- name: application.rules
+  interval: 30s
+  rules:
+  # Service availability alerts
+  - alert: ServiceDown
+    expr: |
+      up{job=~"user-service|product-service|order-service"} == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Service {{ $labels.job }} is down"
+      description: "{{ $labels.job }} has been unavailable for more than 2 minutes"
+
+  # Request rate and error alerts
+  - alert: HighErrorRate
+    expr: |
+      (sum(rate(http_request_total{status=~"5.."}[5m])) by (job) / sum(rate(http_request_total[5m])) by (job)) > 0.05
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High error rate in {{ $labels.job }}"
+      description: "Error rate is {{ $value | humanizePercentage }} for {{ $labels.job }}"
+
+  - alert: HighLatency
+    expr: |
+      histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job)) > 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High latency in {{ $labels.job }}"
+      description: "95th percentile latency is {{ $value }}s for {{ $labels.job }}"
+
+  - alert: RequestQueueBacklog
+    expr: |
+      histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job)) > 5
+    for: 10m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Request queue backlog in {{ $labels.job }}"
+      description: "99th percentile latency is {{ $value }}s"
+
+- name: database.rules
+  interval: 30s
+  rules:
+  # PostgreSQL alerts
+  - alert: PostgreSQLDown
+    expr: |
+      pg_up{job="postgresql"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "PostgreSQL is down"
+      description: "PostgreSQL database is not responding"
+
+  - alert: PostgreSQLSlowQueries
+    expr: |
+      pg_slow_queries > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "PostgreSQL slow queries detected"
+      description: "{{ $value }} slow queries detected in the last 5 minutes"
+
+  - alert: PostgreSQLTooManyConnections
+    expr: |
+      sum(pg_stat_activity_count) by (datname) / pg_settings_max_connections > 0.8
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "PostgreSQL connection pool is {{ $value | humanizePercentage }} full"
+      description: "Connection utilization is high for database {{ $labels.datname }}"
+
+  - alert: PostgreSQLReplicationLag
+    expr: |
+      pg_replication_lag > 10
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "PostgreSQL replication lag detected"
+      description: "Replication lag is {{ $value }}s"
+
+  # Redis alerts
+  - alert: RedisDown
+    expr: |
+      redis_up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Redis is down"
+      description: "Redis server is not responding"
+
+  - alert: RedisHighMemoryUsage
+    expr: |
+      redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Redis memory usage is high"
+      description: "Memory utilization is {{ $value | humanizePercentage }}"
+
+- name: infrastructure.rules
+  interval: 30s
+  rules:
+  # CPU and memory alerts
+  - alert: HighCPUUsage
+    expr: |
+      (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)) > 0.8
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage on {{ $labels.instance }}"
+      description: "CPU usage is {{ $value | humanizePercentage }}"
+
+  - alert: HighMemoryUsage
+    expr: |
+      (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage on {{ $labels.instance }}"
+      description: "Memory usage is {{ $value | humanizePercentage }}"
+
+  - alert: HighDiskUsage
+    expr: |
+      (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.15
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High disk usage on {{ $labels.instance }}"
+      description: "Only {{ $value | humanizePercentage }} disk space available"
+
+  - alert: DiskWillFillIn24h
+    expr: |
+      predict_linear(node_filesystem_avail_bytes[1h], 24*3600) < 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Disk will fill in 24 hours on {{ $labels.instance }}"
+      description: "Based on current disk usage trends"
+
+  - alert: HighNetworkIn
+    expr: |
+      sum(rate(node_network_receive_bytes_total[5m])) by (instance) > 1000000000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High network input on {{ $labels.instance }}"
+      description: "Network input rate is {{ $value | humanize }}B/s"
+
+  # RabbitMQ alerts
+  - alert: RabbitMQDown
+    expr: |
+      rabbitmq_up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "RabbitMQ is down"
+
+  - alert: RabbitMQHighQueueDepth
+    expr: |
+      rabbitmq_queue_messages_ready > 1000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "RabbitMQ queue {{ $labels.queue }} has high depth"
+      description: "Queue has {{ $value }} messages waiting"
+
+  # Elasticsearch alerts
+  - alert: ElasticsearchDown
+    expr: |
+      elasticsearch_up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Elasticsearch is down"
+
+  - alert: ElasticsearchHighJVMUsage
+    expr: |
+      elasticsearch_jvm_memory_used_bytes / elasticsearch_jvm_memory_max_bytes > 0.85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Elasticsearch JVM memory usage is high"
+      description: "JVM memory utilization is {{ $value | humanizePercentage }}"

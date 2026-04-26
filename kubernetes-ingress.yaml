@@ -1,0 +1,221 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-gateway-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: "alb"
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:123456789:certificate/xxxxxxxx"
+    alb.ingress.kubernetes.io/ssl-policy: "ELBSecurityPolicy-TLS-1-2-2017-01"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/healthcheck-path: "/health"
+    alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:us-east-1:123456789:global/webacl/example/a1234567"
+    alb.ingress.kubernetes.io/load-balancer-attributes: |
+      idle_timeout.connection.seconds=60,
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=alb-logs,
+      access_logs.s3.prefix=api-gateway,
+      deletion_protection.enabled=false
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    - api-staging.example.com
+    secretName: api-gateway-tls
+  rules:
+  # Production API
+  - host: api.example.com
+    http:
+      paths:
+      # User Service routes
+      - path: /api/v1/users
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80
+      - path: /api/v1/auth
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80
+      # Product Service routes
+      - path: /api/v1/products
+        pathType: Prefix
+        backend:
+          service:
+            name: product-service
+            port:
+              number: 80
+      - path: /api/v1/search
+        pathType: Prefix
+        backend:
+          service:
+            name: product-service
+            port:
+              number: 80
+      # Order Service routes
+      - path: /api/v1/orders
+        pathType: Prefix
+        backend:
+          service:
+            name: order-service
+            port:
+              number: 80
+      - path: /api/v1/checkout
+        pathType: Prefix
+        backend:
+          service:
+            name: order-service
+            port:
+              number: 80
+      # Payment Service routes
+      - path: /api/v1/payments
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-service
+            port:
+              number: 80
+      # Health check
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: api-gateway
+            port:
+              number: 80
+      # Metrics (internal only - should be restricted)
+      - path: /metrics
+        pathType: Exact
+        backend:
+          service:
+            name: api-gateway
+            port:
+              number: 80
+  # Staging API
+  - host: api-staging.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-gateway
+            port:
+              number: 80
+
+---
+# API Gateway Network Policy (optional - for service mesh)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow access to other services
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Allow external HTTPS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Service for API Gateway
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: production
+  labels:
+    app: api-gateway
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  selector:
+    app: api-gateway
+
+---
+# Certificate for TLS (if using cert-manager)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: api-gateway-tls
+  namespace: production
+spec:
+  secretName: api-gateway-tls
+  duration: 2160h # 90 days
+  renewBefore: 360h # 15 days
+  commonName: api.example.com
+  dnsNames:
+  - api.example.com
+  - api-staging.example.com
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+
+---
+# ClusterIssuer for Let's Encrypt
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: alb
+    - dns01:
+        route53:
+          region: us-east-1

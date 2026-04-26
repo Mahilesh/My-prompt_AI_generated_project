@@ -1,0 +1,340 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'docker/**'
+      - 'kubernetes/**'
+      - '.github/workflows/build-deploy.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service, payment-service]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: 'src/${{ matrix.service }}/package-lock.json'
+
+    - name: Install dependencies
+      working-directory: src/${{ matrix.service }}
+      run: npm ci
+
+    - name: Lint code
+      working-directory: src/${{ matrix.service }}
+      run: npm run lint --if-present
+
+    - name: Run unit tests
+      working-directory: src/${{ matrix.service }}
+      run: npm run test:unit --if-present
+
+    - name: Run integration tests
+      working-directory: src/${{ matrix.service }}
+      run: npm run test:integration --if-present
+
+    - name: Upload coverage reports
+      if: always()
+      uses: codecov/codecov-action@v3
+      with:
+        files: src/${{ matrix.service }}/coverage/coverage-final.json
+        flags: ${{ matrix.service }}
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service, payment-service]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: 'src/${{ matrix.service }}/package-lock.json'
+
+    - name: Install dependencies
+      working-directory: src/${{ matrix.service }}
+      run: npm ci
+
+    - name: Run security audit
+      working-directory: src/${{ matrix.service }}
+      run: npm audit --audit-level=moderate
+
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarcloud-github-action@master
+      with:
+        projectBaseDir: src/${{ matrix.service }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service, payment-service]
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Log in to Container Registry
+      if: github.event_name == 'push'
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: src/${{ matrix.service }}
+        file: src/${{ matrix.service }}/Dockerfile
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Scan image with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_STAGING }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig \
+          --region ${{ env.AWS_REGION }} \
+          --name microservices-eks-cluster-staging
+
+    - name: Install Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'v3.12.0'
+
+    - name: Deploy with Helm
+      run: |
+        helm repo add myrepo ${{ secrets.HELM_REPO_URL }}
+        helm repo update
+        
+        for service in user-service product-service order-service payment-service; do
+          helm upgrade --install $service myrepo/$service \
+            --namespace staging \
+            --values kubernetes/helm/values-staging.yaml \
+            --set image.tag=${{ github.sha }}
+        done
+
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment -n staging --timeout=5m
+
+    - name: Run smoke tests
+      run: |
+        bash scripts/smoke-tests.sh staging
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://api.example.com
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_PRODUCTION }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig \
+          --region ${{ env.AWS_REGION }} \
+          --name microservices-eks-cluster
+
+    - name: Install Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'v3.12.0'
+
+    - name: Create release notes
+      id: release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: release-${{ github.sha }}
+        release_name: Release ${{ github.sha }}
+        body: |
+          Deployment of version ${{ github.sha }}
+          
+          Services deployed:
+          - user-service
+          - product-service
+          - order-service
+          - payment-service
+
+    - name: Deploy with ArgoCD
+      run: |
+        curl -X POST https://argocd.example.com/api/v1/applications/microservices/sync \
+          -H "Authorization: Bearer ${{ secrets.ARGOCD_TOKEN }}"
+
+    - name: Wait for ArgoCD sync
+      run: |
+        bash scripts/wait-argocd-sync.sh microservices 300
+
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment -n production --timeout=5m
+
+    - name: Run smoke tests
+      run: |
+        bash scripts/smoke-tests.sh production
+
+    - name: Run E2E tests
+      run: |
+        npm run test:e2e
+
+    - name: Slack notification
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: 'Production deployment ${{ job.status }}'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+
+  rollback:
+    name: Rollback (On Failure)
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: failure() && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.before }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_PRODUCTION }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig \
+          --region ${{ env.AWS_REGION }} \
+          --name microservices-eks-cluster
+
+    - name: Trigger ArgoCD rollback
+      run: |
+        curl -X POST https://argocd.example.com/api/v1/applications/microservices/rollback \
+          -H "Authorization: Bearer ${{ secrets.ARGOCD_TOKEN }}"
+
+    - name: Slack rollback notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: 'warning'
+        text: 'Production rollback initiated'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
